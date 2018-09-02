@@ -4,22 +4,23 @@ Unauthorized copying of this file, via any medium is strictly prohibited
 Proprietary and confidential
 """
 import functools
-import time
+import operator
 from datetime import date
-from typing import Dict
+from enum import Enum
+from typing import Dict, Callable
 
-from pyspark.sql import DataFrame, functions as sqlf, Column
+from pyspark.sql import DataFrame, functions as sqlf, Column, Window
 from pyspark.sql.types import IntegerType
 
 from transforms.conf.model.medical import SvcCat
 from transforms.models.derived import CareGaps
-from transforms.models.helpers import Psych, Sleep as S
+from transforms.models.helpers import Sleep as S
 from transforms.runners.base import RunnerConf
 from transforms.runners.derived import DerivedRunner
 
 from transforms.models.core import Medical as MED, Member as MM, Rx as RX
 from transforms.models.derived import CareGaps as CG
-from transforms.util.df import LEFT_OUTER, INNER, LEFT_ANTI, get_uuid_udf
+from transforms.util.df import LEFT_OUTER, INNER, LEFT_ANTI
 
 ANTIPSYCHOTIC = "antipsychotic"
 ANTIDEPRESSANT = "antidepressant"
@@ -29,8 +30,13 @@ IP_SVC_CAT = "IP_acute"
 DISCHARGE_DATE_COL = "discharge_Date"
 HEDIS_DF = "hedis_df"
 BH_CAT_BROAD_LIST = [ANTIPSYCHOTIC, ANTIDEPRESSANT, "Anxiolytic", "Stimulant", "AlcoholDeterrent", "MoodStabilizer"]
+PCC_SUB_LIST = ["sleepdo", "arthritis", "pain", "obesity", "asthma", "hiv", "gastro"]
 
 PARTITION_COLUMN = "__partition_column__"
+FOLLOWUP_NO_DAYS = 999
+GAP_DAYS = 90
+DAYS_OF_SERVICE = 2
+DX_DOS = 2
 
 MED_FIELDS_REQ = [MED.cpt_hcpcs_cd.n, MED.is_bhp.n, MED.pos_cd.n, MED.rev_cd.n, MED.bh_conditions.n, MED.member_uuid.n,
                   MED.claim_id.n, MED.claim_from_dt.n, MED.claim_to_dt.n, MED.ip_episode.n, MED.dx_chapter.n,
@@ -59,9 +65,8 @@ def get_bhp_cpt_hcpcs_codes_col() -> Column:
                     ("99241", "99245"), ("99341", "99345"), ("99347", "99350"), ("99384", "99387"), ("99393", "99397"),
                     ("99401", "99404"), ("G0409", "G0411"), ("H0034", "H0037"), ("H2010", "H2020")]
 
-    col_trim = sqlf.trim(MED.cpt_hcpcs_cd.c)
-    between_exp = functools.reduce(lambda x, y: x | y, [col_trim.between(r[0], r[1]) for r in hcpcs_ranges])
-    return sqlf.when((between_exp | col_trim.isin(hcpcs_codes)) & MED.is_bhp.c, 1)
+    between_exp = functools.reduce(operator.or_, [MED.cpt_hcpcs_cd.c.between(r[0], r[1]) for r in hcpcs_ranges])
+    return sqlf.when((between_exp | MED.cpt_hcpcs_cd.c.isin(hcpcs_codes)) & MED.is_bhp.c, True).otherwise(False)
 
 
 def get_bhp_cpt_and_pos_col() -> Column:
@@ -75,9 +80,9 @@ def get_bhp_cpt_and_pos_col() -> Column:
     pos_cds = ["03", "05", "07", "09", "11", "12", "13", "14", "15", "20", "22",
                "24", "33", "49", "52", "52", "53", "71", "72"]
 
-    return (sqlf.when(sqlf.trim(MED.cpt_hcpcs_cd.c).isin(hcpcs_codes) &
+    return (sqlf.when(MED.cpt_hcpcs_cd.c.isin(hcpcs_codes) &
                       MED.pos_cd.c.isin(pos_cds) &
-                      MED.is_bhp.c, 1))
+                      MED.is_bhp.c, True).otherwise(False))
 
 
 def get_bhp_cpt_and_pos_num3_col() -> Column:
@@ -86,9 +91,9 @@ def get_bhp_cpt_and_pos_num3_col() -> Column:
     """
     hcpcs_codes = ["99238", "99239", "99222", "99232", "99252", "99253", "99254"]
 
-    return (sqlf.when(sqlf.trim(MED.cpt_hcpcs_cd.c).isin(hcpcs_codes) &
+    return (sqlf.when(MED.cpt_hcpcs_cd.c.isin(hcpcs_codes) &
                       MED.pos_cd.c.isin(["52", "53"]) &
-                      MED.is_bhp.c, 1))
+                      MED.is_bhp.c, True).otherwise(False))
 
 
 def get_rev_cd_without_bhp_col() -> Column:
@@ -99,7 +104,7 @@ def get_rev_cd_without_bhp_col() -> Column:
                "521", "522", "523", "526", "527", "528", "529"]
 
     return (sqlf.when(sqlf.substring(MED.rev_cd.c, -3, 3).isin(rev_cds) &
-                      (MED.is_bhp.c | (sqlf.size(MED.bh_conditions.c) > 0)), 1))
+                      (MED.is_bhp.c | (sqlf.size(MED.bh_conditions.c) > 0)), True).otherwise(False))
 
 
 def get_bhp_revcodes() -> Column:
@@ -109,8 +114,19 @@ def get_bhp_revcodes() -> Column:
     col_shift = sqlf.substring(MED.rev_cd.c, -3, 3)
     col = (sqlf.when(col_shift.isin(["513", "907", "919"]) |
                      col_shift.between("900", "905") |
-                     col_shift.between("911", "917"), 1))
+                     col_shift.between("911", "917"), True).otherwise(False))
     return col
+
+
+def get_max_supply_end_dt_col():
+    # It is not allowed to use an aggregate function in the argument of another aggregate function.
+    #  Please use the inner aggregate function in a sub-query (or) expression as below also works
+    # ex: this will fail - sqlf.max(sqlf.date_add(RX.fill_dt.c, RX.days_supply.c))
+    # Tested: var ds = session.sql("select * from range(10)")
+    #       val col = max(expr("date_add(current_date(), id)")).alias("test")
+    #       ds = ds.groupBy("id").agg(col)
+    #       ds.show()
+    return sqlf.max(sqlf.expr("date_add(fill_dt,days_supply)")).alias("max_end_dt")
 
 
 class CareGapsRunner(DerivedRunner):
@@ -119,27 +135,16 @@ class CareGapsRunner(DerivedRunner):
         self.dates = {}
 
     def run(self):
-        # load dependent data models for care gaps.
         self.load_required_dfs()
 
-        # make dates from Member month..
         self.dates = self.make_dates_from_member_month()
 
-        start_time = time.time()
-        self.logger.info("Care gaps execution start time: {}".format(start_time))
-
-        # care_gap_outcomes data frame shell
         self.make_care_gap_df()
 
-        # make care gaps data frame..
         self.make_care_gap_outcomes()
 
         # Write care gaps data to s3..
         self.write(self.spark.table(CG.name_).select(*CG.field_names_))
-
-        end_time = time.time()
-        self.logger.info("Care gaps execution end time: {}".format(end_time))
-        self.logger.info("--- Total execution time: %s seconds ---" % (time.time() - start_time))
 
     def load_required_dfs(self) -> None:
         """
@@ -169,18 +174,10 @@ class CareGapsRunner(DerivedRunner):
         rx_df.createOrReplaceTempView(RX.name_)
         rx_df.cache()
 
-        # Broadcast Psych data frame to make it efficient for joins between a large table with relatively small tables
-        psych_df = self.load_helper_for_join(Psych)
-        psych_df = sqlf.broadcast(psych_df)
-        psych_df.createOrReplaceTempView(Psych.name_)
-
-        # psych_df.cache()
-
         # Broadcast Sleep data frame to make it efficient for joins between a large table with relatively small tables
         sleep_df = self.load_helper_for_join(S)
         sleep_df = sqlf.broadcast(sleep_df)
         sleep_df.createOrReplaceTempView(S.name_)
-        # sleep_df.cache()
 
         # generate hedis data frame.
         hedis_df = self.make_hedis_df()
@@ -195,41 +192,47 @@ class CareGapsRunner(DerivedRunner):
         :return: returns data frame
         """
         group_by_cols = [MED.member_uuid.c, MED.ip_episode.c, MED.dx_chapter.c]
-        agg_cols = [sqlf.min(MED.claim_from_dt.c).alias("admit_date"),
-                    sqlf.max(MED.claim_to_dt.c).alias(DISCHARGE_DATE_COL)]
+        agg_cols = [sqlf.max(MED.claim_to_dt.c).alias(DISCHARGE_DATE_COL)]
+
+        # # get claims data frame between provided dates and bh_conditions is not empty
+        # med_df = self.spark.table(MED.name_)
+        # med_df = (med_df.filter(MED.claim_from_dt.c.between(start_dt, end_dt) &
+        #                         (sqlf.size(MED.bh_conditions.c) > 0) &
+        #                         (MED.svc_cat.c == SvcCat.IPAcute.value))
+        #           .groupBy(*group_by_cols)
+        #           .agg(*agg_cols))
+        # return self.get_gaps_df(episodes_df=med_df, start_dt=start_dt)
 
         # get claims data frame between provided dates and bh_conditions is not empty
         med_df = self.spark.table(MED.name_)
         med_df = med_df.filter(MED.claim_from_dt.c.between(start_dt, end_dt) & (sqlf.size(MED.bh_conditions.c) > 0))
 
         # apply additional filter on claims data frame and aggregate
-        df = (med_df.filter(MED.svc_cat.c.contains(IP_SVC_CAT))
+        df = (med_df.filter(MED.svc_cat.c == SvcCat.IPAcute.value)
               .groupBy(*group_by_cols)
               .agg(*agg_cols))
-
         return self.get_gaps_df(episodes_df=df, start_dt=start_dt)
 
-    def make_er_followup(self, start_dt: Column, end_dt: Column, y2_start_dt: Column) -> DataFrame:
+    def make_er_followup(self, start_dt: Column, end_dt: Column) -> DataFrame:
         """
         Calculate the period of time which an patient spends under the er care
         :param start_dt: start_date
         :param end_dt: end_date
-        :param y2_start_dt: y2_start_dt
         :return: returns data frame
         """
         group_by_cols = [MED.member_uuid.c, MED.claim_id.c]
 
         agg_cols = [sqlf.min(MED.claim_from_dt.c).alias(DISCHARGE_DATE_COL)]
 
-        # get claims data frame between provided dates and bh_conditions is not empty
-        med_df = self.get_filtered_med_df(start_dt=start_dt, end_dt=end_dt)
+        # get claims data frame between provided dates, bh_conditions is not empty and svc_cat
+        med_df = self.spark.table(MED.name_)
+        med_df = (med_df.filter(MED.claim_from_dt.c.between(start_dt, end_dt) &
+                                (sqlf.size(MED.bh_conditions.c) > 0) &
+                                (MED.svc_cat.c == SvcCat.VisitER.value))
+                  .groupBy(*group_by_cols)
+                  .agg(*agg_cols))
 
-        # apply additional filter on claims data frame and aggregate
-        df = (med_df.filter(MED.svc_cat.c == SvcCat.VisitER.value)
-              .groupBy(*group_by_cols)
-              .agg(*agg_cols))
-
-        return self.get_gaps_df(episodes_df=df, start_dt=y2_start_dt)
+        return self.get_gaps_df(episodes_df=med_df, start_dt=start_dt)
 
     def get_filtered_med_df(self, start_dt: Column, end_dt: Column) -> DataFrame:
         """
@@ -262,7 +265,7 @@ class CareGapsRunner(DerivedRunner):
                      .select(MED.member_uuid.c))
 
         # extract non bhp members and cnt_sud >= 2
-        df = df.select(MED.member_uuid.c).filter((sqlf.col("cnt_sud") >= 2) &
+        df = df.select(MED.member_uuid.c).filter((sqlf.col("cnt_sud") >= DAYS_OF_SERVICE) &
                                                  ~MED.member_uuid.c.isin(is_bhp_df[MED.member_uuid.n]))
         return df
 
@@ -286,10 +289,10 @@ class CareGapsRunner(DerivedRunner):
 
         # care gaps column
         temp_gaps_col = "gaps"
-        gaps_col = (sqlf.when(mem_id_col.isNull(), 999)
+        gaps_col = (sqlf.when(mem_id_col.isNull(), FOLLOWUP_NO_DAYS)
                     .otherwise(sqlf.datediff(claim_from_dt_col, sqlf.col(DISCHARGE_DATE_COL))).alias(temp_gaps_col))
 
-        cols = [mem_id_col, gaps_col]
+        cols = [mem_id_col, sqlf.col(DISCHARGE_DATE_COL), claim_from_dt_col, gaps_col]
 
         # calculate care gaps by joining episodes data frame and hedis data frame
         df = (episodes_df.join(hedis_df, on=[episodes_df[MED.member_uuid.n] == mem_id_col], how=LEFT_OUTER)
@@ -300,7 +303,7 @@ class CareGapsRunner(DerivedRunner):
 
         # return members with min care gap > 90 days
         min_gap_col = sqlf.min(sqlf.col(temp_gaps_col)).alias(temp_gaps_col)
-        return df.groupBy(MED.member_uuid.c).agg(min_gap_col).filter(sqlf.col(temp_gaps_col) > 90)
+        return df.groupBy(MED.member_uuid.c).agg(min_gap_col).filter(sqlf.col(temp_gaps_col) > GAP_DAYS)
 
     def get_bhp_members_df(self, start_dt: Column, end_dt: Column):
         # filter medical claims between provided dates and is_bhp = true
@@ -316,14 +319,19 @@ class CareGapsRunner(DerivedRunner):
         is_bhp_df = (self.get_bhp_members_df(start_dt=start_dt, end_dt=end_dt)
                      .select(MED.member_uuid.c))
 
-        med_df = self.spark.table(MED.name_)
+        med_cols = [MED.svc_cat.c, MED.claim_from_dt.c, MED.member_uuid.c, MED.claim_id.c]
+        med_df = self.spark.table(MED.name_).select(*med_cols)
+        med_df = (med_df.filter((MED.svc_cat.c == SvcCat.VisitER.value) &
+                                MED.claim_from_dt.c.between(start_dt, end_dt))
+                  .groupBy(*[MED.member_uuid.n, MED.claim_id.n])
+                  .agg(sqlf.min(MED.claim_from_dt.c).alias(MED.claim_from_dt.n)))
 
         # extract members where distinct claim_from_dt count >= 3
-        dist_col = sqlf.countDistinct(MED.claim_from_dt.c)
+        dist_col = sqlf.countDistinct(MED.claim_from_dt.c).alias("dist_col")
         df = (med_df.filter(~MED.member_uuid.c.isin(is_bhp_df[MED.member_uuid.n]))
               .groupBy(MED.member_uuid.c)
               .agg(*[dist_col])
-              .filter(dist_col >= 3))
+              .filter(sqlf.col("dist_col") >= 3))
         return df
 
     def make_psychotrope_new_gen_df(self, start_dt: Column, end_dt: Column, y1_q4_start_dt: Column) -> DataFrame:
@@ -389,7 +397,7 @@ class CareGapsRunner(DerivedRunner):
         df = (med_df.filter(~MED.member_uuid.c.isin(in_care_df[MED.member_uuid.n]))
               .groupBy(MED.member_uuid.c)
               .agg(agg_col)
-              .filter(agg_col >= 2)
+              .filter(agg_col >= DAYS_OF_SERVICE)
               .select(MED.member_uuid.c))
 
         return df
@@ -426,13 +434,14 @@ class CareGapsRunner(DerivedRunner):
         # BHP visits in time period
         is_bhp_df = self.get_bhp_members_df(start_dt=start_dt, end_dt=end_dt).select(MED.member_uuid.c)
 
-        # 80th percentile
-        df.createOrReplaceTempView("cnt_df")
-        df = self.spark.sql("select percentile_approx(cnt, 0.8) as percentile_cnt, member_uuid, cnt "
-                            "from cnt_df group by member_uuid, cnt having percentile_cnt < cnt")
-
-        df = (df.select(MED.member_uuid.c)
-              .filter(~MED.member_uuid.c.isin(is_bhp_df[MED.member_uuid.n])))
+        # 80th percentile col
+        cnt_col = sqlf.col("cnt")
+        window_spec = Window.orderBy(cnt_col.desc())
+        # col = sqlf.percent_rank().over(window_spec).alias("percentile_cnt")
+        col = sqlf.when(sqlf.percent_rank().over(window_spec) == 0.8, cnt_col).alias("percentile_cnt")
+        df = (df.select(*[MED.member_uuid.c, col])
+              .filter((cnt_col > sqlf.col("percentile_cnt")) &
+                      ~MED.member_uuid.c.isin(is_bhp_df[MED.member_uuid.n])))
         return df
 
     def make_sleep_obesity_nobhp(self, start_dt: Column, end_dt: Column, y2_q3: Column) -> DataFrame:
@@ -474,18 +483,15 @@ class CareGapsRunner(DerivedRunner):
 
         # last 6 month medical more then 2 dos
         distinct_count_col = sqlf.countDistinct(MED.claim_from_dt.c).alias("dist_days_cnt")
+        condition_exp = functools.reduce(operator.or_,
+                                         [sqlf.array_contains(MED.chronic_conditions_primary.c, r)
+                                          for r in PCC_SUB_LIST])
         last_6_month_df = (med_df.filter((MED.chronic_conds_cnt.c > 0) &
-                                         (sqlf.array_contains(MED.chronic_conditions_primary.c, "sleepdo") |
-                                          sqlf.array_contains(MED.chronic_conditions_primary.c, "arthritis") |
-                                          sqlf.array_contains(MED.chronic_conditions_primary.c, "pain") |
-                                          sqlf.array_contains(MED.chronic_conditions_primary.c, "obesity") |
-                                          sqlf.array_contains(MED.chronic_conditions_primary.c, "asthma") |
-                                          sqlf.array_contains(MED.chronic_conditions_primary.c, "hiv") |
-                                          sqlf.array_contains(MED.chronic_conditions_primary.c, "gastro")) &
+                                         condition_exp &
                                          MED.claim_from_dt.c.between(start_dt, end_dt))
                            .groupBy(*med_cols)
                            .agg(distinct_count_col)
-                           .filter(sqlf.col("dist_days_cnt") > 2))
+                           .filter(sqlf.col("dist_days_cnt") > DX_DOS))
 
         med_id_6 = last_6_month_df[MED.member_uuid.n]
         med_id_12 = prior_12_month_df[MED.member_uuid.n]
@@ -511,8 +517,7 @@ class CareGapsRunner(DerivedRunner):
 
         rx_groupby_cols = [RX.member_uuid.c, RX.bh_cat_broad.c]
 
-        # end_dt_col = sqlf.max(sqlf.date_add(RX.fill_dt.c, RX.days_supply.c))
-        end_dt_col = sqlf.max(sqlf.expr("date_add(fill_dt,days_supply)")).alias("max_end_dt")
+        end_dt_col = get_max_supply_end_dt_col()
         start_dt_col = sqlf.min(RX.fill_dt.c).alias("min_start_dt")
         total_supply_col = sqlf.sum(RX.days_supply.c).alias("total_cnt")
 
@@ -528,19 +533,12 @@ class CareGapsRunner(DerivedRunner):
               .filter(calc_value < .8))
         return df
 
-    def make_adh_ap(self, mpr_df: DataFrame) -> DataFrame:
+    def make_adh(self, mpr_df: DataFrame, adh: str) -> DataFrame:
         """
-        Members with PDC < .8 for Antipsychotic drugs.
+        Members with PDC < .8 for provided adh drug.
         Look-back of 12 months.
         """
-        return mpr_df.select(RX.member_uuid.c).filter(sqlf.lower(RX.bh_cat_broad.c) == ANTIPSYCHOTIC)
-
-    def make_adh_ad(self, mpr_df: DataFrame) -> DataFrame:
-        """
-        Members with PDC < .8 for Antidepressive drugs.
-        Look-back of 12 months.
-        """
-        return mpr_df.select(RX.member_uuid.c).filter(sqlf.lower(RX.bh_cat_broad.c) == ANTIDEPRESSANT)
+        return mpr_df.select(RX.member_uuid.c).filter(sqlf.lower(RX.bh_cat_broad.c) == adh)
 
     def get_lowdose_df(self, start_dt: Column, end_dt: Column, y2_q3_start_dt: Column,
                        bh_cat_broad: str, bh_condition: str) -> DataFrame:
@@ -557,7 +555,7 @@ class CareGapsRunner(DerivedRunner):
                           sqlf.array_contains(MED.bh_conditions.c, bh_condition))
                   .groupBy(MED.member_uuid.n)
                   .agg(med_agg_col)
-                  .filter(sqlf.col("cnt_dist") >= 2)
+                  .filter(sqlf.col("cnt_dist") >= DAYS_OF_SERVICE)
                   .select(MED.member_uuid.c))
 
         # Calculate avg daily dose
@@ -604,7 +602,7 @@ class CareGapsRunner(DerivedRunner):
         rx_df = self.spark.table(RX.name_).select(*rx_cols)
         sleep_df = self.spark.table(S.name_)
 
-        end_dt_col = sqlf.max(sqlf.expr("date_add(fill_dt,days_supply)")).alias("max_end_dt")
+        end_dt_col = get_max_supply_end_dt_col()
         start_dt_col = sqlf.min(RX.fill_dt.c).alias("min_start_dt")
         total_supply_col = sqlf.sum(RX.days_supply.c).alias("total_cnt")
 
@@ -668,91 +666,75 @@ class CareGapsRunner(DerivedRunner):
         y2_11mo_dt = sqlf.lit(self.dates[Y2_11MO_DT])
         y2_end_dt = sqlf.lit(self.dates[Y2_END_DT])
 
-        # make ip_followup_12 column
         df = self.make_ip_followup(start_dt=y2_start_dt, end_dt=y2_11mo_dt)
         self.add_col_to_cg_df(df=df, col_name=CG.ip_followup_12.n)
 
-        # make er_followup_12 column
-        df = self.make_er_followup(start_dt=y2_q3_start_dt, end_dt=y2_11mo_dt, y2_start_dt=y2_start_dt)
+        df = self.make_er_followup(start_dt=y2_start_dt, end_dt=y2_11mo_dt)
         self.add_col_to_cg_df(df=df, col_name=CG.er_followup_12.n)
 
-        # make er_no_bhp_3_12 column
         df = self.make_er_no_bhp(start_dt=y2_start_dt, end_dt=y2_end_dt)
         self.add_col_to_cg_df(df=df, col_name=CG.er_no_bhp_3_12.n)
 
-        # make sud_no_bhp_12 column
         df = self.make_sud_no_bhp(start_dt=y2_start_dt, end_dt=y2_end_dt)
         self.add_col_to_cg_df(df=df, col_name=CG.sud_no_bhp_12.n)
 
-        # make psychotrope_new_gen column
         df = self.make_psychotrope_new_gen_df(start_dt=y2_q4_start_dt, end_dt=y2_end_dt, y1_q4_start_dt=y1_q4_start_dt)
+        # Cache psychotrope gen data frame to avoid recomputation
         df.cache()
         self.add_col_to_cg_df(df=df, col_name=CG.psychotrope_new_gen.n)
 
-        # make psychotrope_new_nobh_gen column
         df = self.make_psyc_nobhp_gen(rx_df=df, start_dt=y2_q4_start_dt, end_dt=y2_end_dt)
         self.add_col_to_cg_df(df=df, col_name=CG.psychotrope_new_nobh_gen.n)
         df.unpersist()
 
-        # make bhp_dropout_3 column
         df = self.make_bhp_dropout(start_dt=y2_start_dt, end_dt=y2_end_dt, y2_q4_start_dt=y2_q4_start_dt)
         self.add_col_to_cg_df(df=df, col_name=CG.bhp_dropout_3.n)
 
-        # make bhdx_no_care_2 column
         df = self.make_bhdx_no_care(start_dt=y2_q3_start_dt, end_dt=y2_end_dt)
         self.add_col_to_cg_df(df=df, col_name=CG.bhdx_no_care_2.n)
 
-        # make multi_bh_3_12 column
         df = self.make_bhdx(start_dt=y2_q3_start_dt, end_dt=y2_end_dt)
         self.add_col_to_cg_df(df=df, col_name=CG.multi_bh_3_12.n)
 
-        # make highpain_noBHP_80 column
-        df = self.make_high_pain_no_bhp(start_dt=y2_q3_start_dt, end_dt=y2_end_dt)
-        self.add_col_to_cg_df(df=df, col_name=CG.highpain_nobhp_80.n)
+        # df = self.make_high_pain_no_bhp(start_dt=y2_q3_start_dt, end_dt=y2_end_dt)
+        # self.add_col_to_cg_df(df=df, col_name=CG.highpain_nobhp_80.n)
+        cgd = self.spark.table(CG.name_)
+        cgd = cgd.withColumn(CG.highpain_nobhp_80.n, sqlf.lit(0))
+        cgd.createOrReplaceTempView(CG.name_)
+        cgd.cache()
 
-        # make sleepobesity_nobhp_12 column
         df = self.make_sleep_obesity_nobhp(start_dt=y2_start_dt, end_dt=y2_end_dt, y2_q3=y2_q3_start_dt)
         self.add_col_to_cg_df(df=df, col_name=CG.sleepobesity_nobhp_12.n)
 
-        # make newchronicsub column
         df = self.make_newchronicsub(start_dt=y2_q3_start_dt, end_dt=y2_end_dt, y1_start_dt=y1_start_dt)
         self.add_col_to_cg_df(df=df, col_name=CG.newchronicsub.n)
 
         mpr_df = self.get_mpr_df(start_dt=y2_start_dt, end_dt=y2_end_dt)
         mpr_df.cache()
-        # make adh_ap_12 column
-        df = self.make_adh_ap(mpr_df=mpr_df)
+        df = self.make_adh(mpr_df=mpr_df, adh=ANTIPSYCHOTIC)
         self.add_col_to_cg_df(df=df, col_name=CG.adh_ap_12.n)
 
-        # make adh_ad_12 column
-        df = self.make_adh_ad(mpr_df=mpr_df)
+        df = self.make_adh(mpr_df=mpr_df, adh=ANTIDEPRESSANT)
         self.add_col_to_cg_df(df=df, col_name=CG.adh_ad_12.n)
         mpr_df.unpersist()
 
-        # make lowdose_ad_70 column
         lowdose_ad_df = self.get_lowdose_df(start_dt=y2_start_dt, end_dt=y2_end_dt, y2_q3_start_dt=y2_q3_start_dt,
                                             bh_cat_broad=ANTIDEPRESSANT, bh_condition="depression")
         self.add_col_to_cg_df(df=lowdose_ad_df, col_name=CG.lowdose_ad_70.n)
 
-        # make lowdose_ap_70 column
         lowdose_ap_df = self.get_lowdose_df(start_dt=y2_start_dt, end_dt=y2_end_dt, y2_q3_start_dt=y2_q3_start_dt,
                                             bh_cat_broad=ANTIPSYCHOTIC, bh_condition="schizophrenia")
         self.add_col_to_cg_df(df=lowdose_ap_df, col_name=CG.lowdose_ap_70.n)
 
-        # make longterm_sh_5 column
         df = self.make_longterm_sh(start_dt=y2_start_dt, end_dt=y2_end_dt)
         self.add_col_to_cg_df(df=df, col_name=CG.longterm_sh_5.n)
 
-        # # make sh_overuse_6 column")
-        # cg_df = cg_df.withColumn(CG.sh_overuse_6.n, sqlf.lit(0))
         df = self.make_sh_overuse(start_dt=y2_q3_start_dt, end_dt=y2_end_dt)
         self.add_col_to_cg_df(df=df, col_name=CG.sh_overuse_6.n)
 
-        # make psychotropes_gte_4 column
         df = self.make_psychotropes_gte(start_dt=y2_q3_start_dt, end_dt=y2_end_dt)
         self.add_col_to_cg_df(df=df, col_name=CG.psychotropes_gte_4.n)
 
-        # make pharmacy_gte_4 column
         df = self.make_pharmacy_gte(start_dt=y2_q3_start_dt, end_dt=y2_end_dt)
         self.add_col_to_cg_df(df=df, col_name=CG.pharmacy_gte_4.n)
 
@@ -760,10 +742,6 @@ class CareGapsRunner(DerivedRunner):
         """
         creates shell with columns for each gap and populate with member_uuids column from current member month
          and couple of useful columns
-        :param run_date: run_date
-        :param begin_month: begin_month
-        :param end_month: end_month
-        :return: returns data frame
         """
         mm_df = self.spark.table(MM.name_).select(MM.member_uuid.c).distinct()
 
@@ -790,27 +768,21 @@ class CareGapsRunner(DerivedRunner):
         HEDIS = We are applying specs that approximate HEDIS (which are very complex)
         psychCodes and aodaCodes - table of psych-related procedure codes used to create HEDIS
         AODA = alcohol and other drug addiction
+        This function will return only members where HEDIS is involved
         """
         med_df = self.spark.table(MED.name_)
-        psych_df = self.spark.table(Psych.name_)
 
         # use this to include only claims where HEDIS is involved
-        hedis_tx_ind = sqlf.lit(sqlf.max(get_bhp_cpt_hcpcs_codes_col()) +
-                                sqlf.max(get_bhp_cpt_and_pos_col()) +
-                                sqlf.max(get_bhp_cpt_and_pos_num3_col()) +
-                                sqlf.max(get_rev_cd_without_bhp_col()) +
-                                sqlf.max(get_bhp_revcodes())).alias("hedis_tx_ind")
+        hedis_filter_condition = sqlf.lit(sqlf.max(get_bhp_cpt_hcpcs_codes_col()) |
+                                          sqlf.max(get_bhp_cpt_and_pos_col()) |
+                                          sqlf.max(get_bhp_cpt_and_pos_num3_col()) |
+                                          sqlf.max(get_rev_cd_without_bhp_col()) |
+                                          sqlf.max(get_bhp_revcodes())).alias("hedis_tx_ind")
 
         # only member_uuid and claim_from_date columns are required
-        agg_cols = [sqlf.min(MED.claim_from_dt.c).alias(MED.claim_from_dt.n), hedis_tx_ind]
+        agg_cols = [sqlf.min(MED.claim_from_dt.c).alias(MED.claim_from_dt.n), hedis_filter_condition]
 
-        df = (med_df.join(psych_df,
-                          on=[sqlf.trim(MED.cpt_hcpcs_cd.c) == Psych.cpt_code.c],
-                          how=LEFT_OUTER)
-              .groupBy(MED.member_uuid.n, MED.claim_id.n)
-              .agg(*agg_cols)
-              .filter(sqlf.col("hedis_tx_ind") > 0))
-        return df
+        return med_df.groupBy(MED.member_uuid.n, MED.claim_id.n).agg(*agg_cols).filter(sqlf.col("hedis_tx_ind"))
 
     def make_dates_from_member_month(self) -> Dict[str, date]:
         """
@@ -832,9 +804,12 @@ class CareGapsRunner(DerivedRunner):
             y1_start_date.alias(Y1_START_DT),
             sqlf.add_months(y1_start_date, 9).alias(Y1_Q4_START_DT)
         ]
+        # dt_cols = [e.func(max_date, e.parameter).alias(e.key_name) for e in GapsDates]
+        # mm_df.select(*dt_cols).show()
         return mm_df.select(*dt_cols).first().asDict()
 
     def add_col_to_cg_df(self, df: DataFrame, col_name: str) -> None:
+        print("Care gaps df for {}: {}".format(col_name, df.count()))
         cg_df = self.spark.table(CG.name_)
         cg_df = (cg_df.join(df.select(MED.member_uuid.c),
                             on=[CG.patient_uuid.c == MED.member_uuid.c], how=LEFT_OUTER)
@@ -842,3 +817,19 @@ class CareGapsRunner(DerivedRunner):
         cg_df = cg_df.drop(MED.member_uuid.c)
         cg_df.createOrReplaceTempView(CG.name_)
         cg_df.cache()
+
+
+# class GapsDates(Enum):
+#     RUN_DATE = ("run_date", sqlf.date_add, -1)
+#     Y2_START_DT = ("y2_start_dt", sqlf.add_months, -12)
+#     Y2_Q3_START_DT = ("y2_q3_start_dt", sqlf.add_months, -6)
+#     Y2_Q4_START_DT = ("y2_q4_start_dt", sqlf.add_months, -9)
+#     Y2_END_DT = ("y2_end_dt", sqlf.date_add, -1)
+#     Y2_11MO_DT = ("y2_11mo_dt", sqlf.date_add, -30)
+#     Y1_START_DT = ("y1_start_dt", sqlf.add_months, -24)
+#     Y1_Q4_START_DT = ("y1_q4_start_dt", sqlf.add_months, -15)
+#
+#     def __init__(self, key_name: str, func: Callable, parameter: int):
+#         self.key_name = key_name
+#         self.func = func
+#         self.parameter = parameter
